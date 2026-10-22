@@ -1,151 +1,143 @@
 
 import os
 import json
-import time
 import urllib.request
 import urllib.parse
 import urllib.error
 from datetime import datetime, timezone
 
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
-CHANNEL = os.environ.get("CHANNEL", "@HadiTradingLive")
-INTERVAL = max(10, int(os.environ.get("UPDATE_SECONDS", "10")))
+CHANNEL = os.environ.get("CHANNEL", "@HadiTradingLive").strip()
+MESSAGE_FILE = "telegram_message.json"
 
-TELEGRAM = "https://api.telegram.org/bot" + BOT_TOKEN
-MESSAGE_ID = None
 
-def get_json(url, headers=None):
+def get_json(url):
     req = urllib.request.Request(
         url,
-        headers={"User-Agent": "MarketPulseBot/1.0",
-                 **(headers or {})}
+        headers={"User-Agent": "MarketPulseBot/1.0"}
     )
     with urllib.request.urlopen(req, timeout=12) as response:
         return json.loads(response.read().decode("utf-8"))
 
-def telegram(method, payload):
-    data = json.dumps(payload).encode("utf-8")
-    req = urllib.request.Request(
-        TELEGRAM + "/" + method,
-        data=data,
-        headers={"Content-Type": "application/json"}
-    )
-    with urllib.request.urlopen(req, timeout=15) as response:
+
+def telegram(method, data):
+    url = f"https://api.telegram.org/bot{BOT_TOKEN}/{method}"
+    body = urllib.parse.urlencode(data).encode()
+    req = urllib.request.Request(url, data=body)
+    with urllib.request.urlopen(req, timeout=20) as response:
         result = json.loads(response.read().decode("utf-8"))
     if not result.get("ok"):
-        raise RuntimeError("Telegram API returned an error")
+        raise RuntimeError(f"Telegram API error: {result}")
     return result["result"]
 
-def gold_price():
-    data = get_json("https://api.gold-api.com/price/XAU")
-    price = data.get("price")
-    if price is None:
-        raise ValueError("Gold price unavailable")
-    return float(price)
 
-def crypto_price(symbol):
-    url = (
-        "https://api.binance.com/api/v3/ticker/price?symbol="
-        + urllib.parse.quote(symbol)
-    )
-    data = get_json(url)
-    return float(data["price"])
-
-def usd_iqd_reference():
-    data = get_json("https://open.er-api.com/v6/latest/USD")
-    rate = data.get("rates", {}).get("IQD")
-    if rate is None:
-        raise ValueError("USD/IQD unavailable")
-    return float(rate)
-
-def price_or_unavailable(fn, fmt):
+def price(url, key=None):
     try:
-        return fmt(fn())
+        data = get_json(url)
+        value = data
+        if key:
+            for part in key.split("."):
+                value = value[part]
+        return value
     except Exception:
+        return None
+
+
+def fmt(value, digits=2):
+    if value is None:
+        return "غير متاح حالياً"
+    try:
+        return f"${float(value):,.{digits}f}"
+    except (ValueError, TypeError):
         return "غير متاح حالياً"
 
-def build_message():
-    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
-    gold = price_or_unavailable(
-        gold_price, lambda p: f"${p:,.2f} للأونصة"
-    )
-    usd = price_or_unavailable(
-        usd_iqd_reference, lambda p: f"{p:,.2f} دينار/دولار"
-    )
+def load_message_id():
+    try:
+        with open(MESSAGE_FILE, "r", encoding="utf-8") as f:
+            return json.load(f).get("message_id")
+    except Exception:
+        return None
 
-    coins = [
-        ("BTCUSDT", "Bitcoin"),
-        ("ETHUSDT", "Ethereum"),
-        ("BNBUSDT", "BNB"),
-        ("SOLUSDT", "Solana"),
-        ("XRPUSDT", "XRP"),
-        ("DOGEUSDT", "Dogecoin"),
-    ]
 
-    lines = [
-        "📊 نبض الأسواق | MARKET PULSE",
-        "━━━━━━━━━━━━━━━━━━",
-        "🥇 الذهب XAU/USD: " + gold,
-        "",
-        "💵 الدولار مقابل الدينار العراقي",
-        "السعر المرجعي: " + usd,
-        "⚠️ سعر الصرف المرجعي ليس سعر السوق الموازي العراقي.",
-        "",
-        "₿ العملات الرقمية",
-    ]
+def save_message_id(message_id):
+    with open(MESSAGE_FILE, "w", encoding="utf-8") as f:
+        json.dump({"message_id": message_id}, f)
 
-    for symbol, name in coins:
-        price = price_or_unavailable(
-            lambda s=symbol: crypto_price(s),
-            lambda p: f"${p:,.8f}".rstrip("0").rstrip(".")
-        )
-        lines.append(f"{name}: {price}")
-
-    lines.extend([
-        "",
-        "💱 الفوركس والنفط والأسهم: تحتاج إلى مصدر بيانات يدعم الرموز المطلوبة.",
-        "🕒 وقت بناء التحديث: " + now,
-        "تُحدّث الرسالة حسب توفر المصادر وحدودها.",
-        "المعلومات ليست توصية استثمارية."
-    ])
-    return "\n".join(lines)
-
-def publish_or_edit(text):
-    global MESSAGE_ID
-
-    if MESSAGE_ID is None:
-        result = telegram("sendMessage", {
-            "chat_id": CHANNEL,
-            "text": text,
-            "disable_web_page_preview": True
-        })
-        MESSAGE_ID = result["message_id"]
-    else:
-        try:
-            telegram("editMessageText", {
-                "chat_id": CHANNEL,
-                "message_id": MESSAGE_ID,
-                "text": text,
-                "disable_web_page_preview": True
-            })
-        except Exception as exc:
-            # If Telegram says the text is unchanged, retain the message.
-            if "message is not modified" not in str(exc).lower():
-                raise
 
 def main():
     if not BOT_TOKEN:
-        raise RuntimeError("Set BOT_TOKEN in hosting environment variables")
+        raise RuntimeError("Missing BOT_TOKEN secret in GitHub Actions.")
 
-    while True:
+    # Gold spot price in USD per troy ounce
+    gold = price("https://api.gold-api.com/price/XAU", "price")
+
+    # Official reference exchange rate; not Iraq's parallel-market rate
+    usd_iqd = price(
+        "https://open.er-api.com/v6/latest/USD",
+        "rates.IQD"
+    )
+
+    # Crypto prices from Binance public ticker API
+    symbols = {
+        "Bitcoin": "BTCUSDT",
+        "Ethereum": "ETHUSDT",
+        "BNB": "BNBUSDT",
+        "Solana": "SOLUSDT",
+        "XRP": "XRPUSDT",
+        "Dogecoin": "DOGEUSDT",
+    }
+
+    crypto_lines = []
+    for name, symbol in symbols.items():
+        value = price(
+            "https://api.binance.com/api/v3/ticker/price?symbol=" + symbol,
+            "price"
+        )
+        crypto_lines.append(f"• {name}: {fmt(value, 6 if name in ('XRP', 'Dogecoin') else 2)}")
+
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+    message = (
+        "📊 نبض الأسواق | MARKET PULSE\n"
+        "━━━━━━━━━━━━━━━━━━\n\n"
+        f"🥇 الذهب XAU/USD: {fmt(gold)} للأونصة\n\n"
+        "💵 الدولار مقابل الدينار العراقي:\n"
+        f"السعر المرجعي: {fmt(usd_iqd)} دينار/دولار\n"
+        "⚠️ هذا سعر مرجعي رسمي، وليس سعر السوق الموازي العراقي.\n\n"
+        "₿ العملات الرقمية:\n"
+        + "\n".join(crypto_lines)
+        + "\n\n"
+        "🛢️ النفط | 💱 الفوركس | 📈 الأسهم:\n"
+        "الأسعار غير متاحة حالياً من مصدر موثوق مهيأ.\n\n"
+        f"🕒 آخر تحديث: {now}\n"
+        "المعلومات للتثقيف والمتابعة وليست توصية استثمارية."
+    )
+
+    message_id = load_message_id()
+
+    if message_id:
         try:
-            publish_or_edit(build_message())
-            print("Market update completed")
+            telegram("editMessageText", {
+                "chat_id": CHANNEL,
+                "message_id": message_id,
+                "text": message,
+                "disable_web_page_preview": "true"
+            })
+            print("Existing channel message updated.")
+            return
         except Exception as exc:
-            print("Update failed:", str(exc)[:300])
+            print(f"Could not edit previous message: {exc}")
 
-        time.sleep(INTERVAL)
+    result = telegram("sendMessage", {
+        "chat_id": CHANNEL,
+        "text": message,
+        "disable_web_page_preview": "true"
+    })
+    message_id = result["message_id"]
+    save_message_id(message_id)
+    print(f"Published message {message_id}.")
+
 
 if __name__ == "__main__":
     main()
